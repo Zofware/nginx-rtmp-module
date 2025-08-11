@@ -19,7 +19,7 @@
 
 
 #if (NGX_WIN32)
-typedef __int8              int8_t;
+typedef signed __int8       int8_t;
 typedef unsigned __int8     uint8_t;
 #endif
 

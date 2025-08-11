@@ -608,12 +608,12 @@ ngx_rtmp_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         if (ngx_strncmp(value[i].data, "ipv6only=o", 10) == 0) {
 #if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
-            struct sockaddr  *sa;
+            struct sockaddr  *sa2;
             u_char            buf[NGX_SOCKADDR_STRLEN];
 
-            sa = (struct sockaddr *) ls->sockaddr;
+            sa2 = (struct sockaddr *) ls->sockaddr;
 
-            if (sa->sa_family == AF_INET6) {
+            if (sa2->sa_family == AF_INET6) {
 
                 if (ngx_strcmp(&value[i].data[10], "n") == 0) {
                     ls->ipv6only = 1;
@@ -631,7 +631,7 @@ ngx_rtmp_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                 ls->bind = 1;
 
             } else {
-                len = ngx_sock_ntop(sa,
+                len = ngx_sock_ntop(sa2,
 #if (nginx_version >= 1005003)
                                     ls->socklen,
 #endif
