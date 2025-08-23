@@ -15,13 +15,14 @@
 #include <unistd.h>
 #endif
 
+#ifdef NGX_WIN32
+#include <strsafe.h>
+#endif
 
-#if !(NGX_WIN32)
 static ngx_rtmp_publish_pt              next_publish;
 static ngx_rtmp_play_pt                 next_play;
 static ngx_rtmp_close_stream_pt         next_close_stream;
 static ngx_rtmp_record_done_pt          next_record_done;
-#endif
 
 
 static ngx_int_t ngx_rtmp_exec_init_process(ngx_cycle_t *cycle);
@@ -81,12 +82,16 @@ typedef struct {
     unsigned                            managed:1;
     ngx_pid_t                           pid;
     ngx_pid_t                          *save_pid;
-    int                                 pipefd;
+    ngx_fd_t                            pipefd;
     ngx_connection_t                    dummy_conn;  /*needed by ngx_xxx_event*/
     ngx_event_t                         read_evt, write_evt;
     ngx_event_t                         respawn_evt;
     ngx_msec_t                          respawn_timeout;
     ngx_int_t                           kill_signal;
+#if NGX_WIN32
+    ngx_fd_t                            pipefd_child;
+    ngx_fd_t                            process_child;
+#endif
 } ngx_rtmp_exec_t;
 
 
@@ -136,11 +141,9 @@ typedef struct {
 } ngx_rtmp_exec_ctx_t;
 
 
-#if !(NGX_WIN32)
 static void ngx_rtmp_exec_respawn(ngx_event_t *ev);
 static ngx_int_t ngx_rtmp_exec_kill(ngx_rtmp_exec_t *e, ngx_int_t kill_signal);
 static ngx_int_t ngx_rtmp_exec_run(ngx_rtmp_exec_t *e);
-#endif
 
 
 static ngx_command_t  ngx_rtmp_exec_commands[] = {
@@ -562,7 +565,6 @@ ngx_rtmp_exec_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
 static ngx_int_t
 ngx_rtmp_exec_init_process(ngx_cycle_t *cycle)
 {
-#if !(NGX_WIN32)
     ngx_rtmp_core_main_conf_t  *cmcf = ngx_rtmp_core_main_conf;
     ngx_rtmp_core_srv_conf_t  **cscf;
     ngx_rtmp_conf_ctx_t        *cctx;
@@ -574,10 +576,12 @@ ngx_rtmp_exec_init_process(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
+#if !(NGX_WIN32)   
     /* execs are always started by the first worker */
     if (ngx_process_slot) {
         return NGX_OK;
     }
+#endif
 
     cscf = cmcf->servers.elts;
     cctx = (*cscf)->ctx;
@@ -601,13 +605,11 @@ ngx_rtmp_exec_init_process(ngx_cycle_t *cycle)
         e->respawn_evt.handler = ngx_rtmp_exec_respawn;
         ngx_post_event((&e->respawn_evt), &ngx_rtmp_init_queue);
     }
-#endif
 
     return NGX_OK;
 }
 
 
-#if !(NGX_WIN32)
 static void
 ngx_rtmp_exec_respawn(ngx_event_t *ev)
 {
@@ -669,16 +671,24 @@ ngx_rtmp_exec_kill(ngx_rtmp_exec_t *e, ngx_int_t kill_signal)
                   "exec: terminating child %ui", (ngx_int_t) e->pid);
 
     e->active = 0;
-    close(e->pipefd);
+    ngx_close_file(e->pipefd);
     if (e->save_pid) {
         *e->save_pid = NGX_INVALID_PID;
     }
+
+#if (NGX_WIN32)
+    ngx_close_file(e->pipefd_child);
+#endif
 
     if (kill_signal == 0) {
         return NGX_OK;
     }
 
+#if (NGX_WIN32)
+    if (!TerminateProcess(e->process_child, 0)) {
+#else
     if (kill(e->pid, kill_signal) == -1) {
+#endif
         ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
                       "exec: kill failed pid=%i", (ngx_int_t) e->pid);
     } else {
@@ -690,10 +700,268 @@ ngx_rtmp_exec_kill(ngx_rtmp_exec_t *e, ngx_int_t kill_signal)
 }
 
 
+#if NGX_WIN32
+
+
+ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
+{
+    ngx_rtmp_exec_t        *e;
+    char                  **args, **arg_out;
+    ngx_str_t              *arg_in, a;
+    ngx_uint_t              n;
+    ngx_rtmp_exec_conf_t   *ec;
+    STARTUPINFO             si;
+    PROCESS_INFORMATION     pi;
+    char                   *command_line;
+    size_t                  command_line_cb;
+    ngx_thread_value_t      ret;
+
+    args = NULL;
+    command_line = NULL;
+
+    do {
+        e = (ngx_rtmp_exec_t *)arg;
+        ec = e->conf;
+        ret = 0;
+
+        args = ngx_alloc((ec->args.nelts + 2) * sizeof(char *), e->log);
+        if (args == NULL) {
+            ret = 1;
+            break;
+        }
+
+        arg_in = ec->args.elts;
+        arg_out = args;
+        *arg_out++ = (char *) ec->cmd.data;
+
+        for (n = 0; n < ec->args.nelts; n++, ++arg_in) {
+
+            if (e->eval == NULL) {
+                a = *arg_in;
+            } else {
+                ngx_rtmp_eval(e->eval_ctx, arg_in, e->eval, &a, e->log);
+            }
+
+            if (ngx_rtmp_eval_streams(&a) != NGX_DONE) {
+                continue;
+            }
+
+            *arg_out++ = (char *) a.data;
+        }
+
+        *arg_out = NULL;
+
+#if (NGX_DEBUG)
+        {
+            char    **p;
+
+            for (p = args; *p; p++) {
+                ngx_write_fd(ngx_stderr, "'", 1);
+                ngx_write_fd(ngx_stderr, *p, strlen(*p));
+                ngx_write_fd(ngx_stderr, "' ", 2);
+            }
+
+            ngx_write_fd(ngx_stderr, "\n", 1);
+        }
+#endif
+
+        // calculate size of command line buffer
+        for (arg_out = args, command_line_cb = 0; *arg_out != NULL; arg_out++) {
+
+            size_t arg_cb;
+            if (FAILED(StringCbLength(*arg_out, command_line_cb + 9999, &arg_cb))) {
+                ret = 1;
+                break;
+            }
+
+            command_line_cb += arg_cb;
+        }
+
+        if (ret) {
+            break;
+        }
+
+        // Account for spaces between args.
+        {
+            size_t space_cb;
+            if (FAILED(StringCbLength(" \0", command_line_cb + 9999, &space_cb))) {
+                ret = 1;
+                break;
+            }
+
+            // Also add space for no fewer than one null terminator.
+            command_line_cb += space_cb * (ec->args.nelts + 1 + 1);
+        }
+
+        if (command_line_cb == 0) {
+            ret = 1;
+            break;
+        }
+
+        // allocate command line buffer
+        command_line = ngx_alloc(command_line_cb, e->log);
+        if (command_line == NULL) {
+            ret = 1;
+            break;
+        }
+        command_line[0] = '\0';
+
+        // fill command line buffer
+        for (arg_out = args; *arg_out != NULL; arg_out++) {
+
+            if (FAILED(StringCbCat(command_line, command_line_cb, *arg_out)) ||
+                FAILED(StringCbCat(command_line, command_line_cb, " "))) {
+                ret = 1;
+                break;
+            }
+        }
+
+        if (ret) {
+            break;
+        }
+
+        ngx_memzero(&si, sizeof(STARTUPINFO));
+        si.cb = sizeof(STARTUPINFO);
+
+        ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
+
+        if (CreateProcess(NULL, command_line,
+                        NULL, NULL, 0, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)
+            == 0)
+        {
+            ngx_log_error(NGX_LOG_CRIT, e->log, ngx_errno,
+                        "CreateProcess(\"%s\") failed", (const char *)args[0]);
+
+            ret = 1;
+            break;
+        }
+
+        if (CloseHandle(pi.hThread) == 0) {
+            ngx_log_error(NGX_LOG_ALERT, e->log, ngx_errno,
+                        "CloseHandle(pi.hThread) failed");
+        }
+
+        ngx_log_error(NGX_LOG_NOTICE, e->log, 0,
+                    "start %s process %P", (const char *)args[0], pi.dwProcessId);
+
+        e->pid = pi.dwProcessId;
+        e->process_child = pi.hProcess;
+
+        if (e->save_pid) {
+            *e->save_pid = pi.dwProcessId;
+        }
+
+        e->active = 1;
+
+        // wait for the process to end
+        WaitForSingleObject(e->process_child, INFINITE);
+
+        // signal that the process ended
+        ngx_write_fd(e->pipefd_child, "end", 3);
+
+    } while (0);
+
+    if (args != NULL) {
+        ngx_free(args);
+        args = NULL;
+    }
+
+    if (command_line != NULL) {
+        ngx_free(command_line);
+        command_line = NULL;
+    }
+
+    return ret;
+}
+
+
+static ngx_int_t
+ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
+{
+    ngx_fd_t                pipefd[2];
+    ngx_rtmp_exec_conf_t   *ec;
+    ngx_tid_t               tid;
+    ngx_err_t               err;
+
+    ec = e->conf;
+
+    ngx_log_error(NGX_LOG_INFO, e->log, 0,
+                  "exec: starting %s child '%V'",
+                  e->managed ? "managed" : "unmanaged", &ec->cmd);
+
+    pipefd[0] = NGX_INVALID_FILE;
+    pipefd[1] = NGX_INVALID_FILE;
+
+    if (e->managed) {
+
+        if (e->active) {
+            ngx_log_debug1(NGX_LOG_DEBUG_RTMP, e->log, 0,
+                           "exec: already active '%V'", &ec->cmd);
+            return NGX_OK;
+        }
+
+        if (!CreatePipe(&pipefd[0], &pipefd[1], NULL, 0)) {
+            ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
+                          "exec: pipe failed");
+        }
+    }
+
+    if (pipefd[0] != NGX_INVALID_FILE && pipefd[1] != NGX_INVALID_FILE) {
+
+        // active and pid set on child thread
+
+        e->pipefd = pipefd[0];
+        e->pipefd_child = pipefd[1];
+
+        e->dummy_conn.fd = (ngx_socket_t)e->pipefd;
+        e->dummy_conn.data = e;
+        e->dummy_conn.read  = &e->read_evt;
+        e->dummy_conn.write = &e->write_evt;
+        e->read_evt.data  = &e->dummy_conn;
+        e->write_evt.data = &e->dummy_conn;
+
+        e->read_evt.log = e->log;
+        e->read_evt.handler = ngx_rtmp_exec_child_dead;
+    }
+
+    // create thread
+    // in thread,
+    //      create process
+    //      wait for process to exit
+    //      call ngx_rtmp_exec_child_dead
+    err = ngx_create_thread(&tid, ngx_rtmp_exec_run_win32_thread, e, e->log);
+    if (err != 0) {
+
+        ngx_close_file(pipefd[0]);
+        ngx_close_file(pipefd[1]);
+
+        ngx_log_error(NGX_LOG_INFO, e->log, err,
+                        "exec: thread creation failed");
+        return NGX_ERROR;
+    }
+
+    if (pipefd[0] != NGX_INVALID_FILE && pipefd[1] != NGX_INVALID_FILE) {
+
+        if (ngx_add_event(&e->read_evt, NGX_READ_EVENT, 0) != NGX_OK) {
+            ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
+                            "exec: failed to add child control event");
+        }
+    }
+
+    return NGX_OK;
+}
+
+#endif // NGX_WIN32
+
+
 static ngx_int_t
 ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
 {
-    int                     fd, ret, maxfd, pipefd[2];
+#if NGX_WIN32
+    return ngx_rtmp_exec_run_win32(e);
+#else
+    ngx_fd_t                fd, pipefd[2];
+    int                     ret, maxfd;
     char                  **args, **arg_out;
     ngx_pid_t               pid;
     ngx_str_t              *arg_in, a;
@@ -706,8 +974,8 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
                   "exec: starting %s child '%V'",
                   e->managed ? "managed" : "unmanaged", &ec->cmd);
 
-    pipefd[0] = -1;
-    pipefd[1] = -1;
+    pipefd[0] = NGX_INVALID_FILE;
+    pipefd[1] = NGX_INVALID_FILE;
 
     if (e->managed) {
 
@@ -734,8 +1002,8 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
 
         if (ret == -1) {
 
-            close(pipefd[0]);
-            close(pipefd[1]);
+            ngx_close_file(pipefd[0]);
+            ngx_close_file(pipefd[1]);
 
             ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
                           "exec: fcntl failed");
@@ -752,12 +1020,12 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
 
             /* failure */
 
-            if (pipefd[0] != -1) {
-                close(pipefd[0]);
+            if (pipefd[0] != NGX_INVALID_FILE) {
+                ngx_close_file(pipefd[0]);
             }
 
-            if (pipefd[1] != -1) {
-                close(pipefd[1]);
+            if (pipefd[1] != NGX_INVALID_FILE) {
+                ngx_close_file(pipefd[1]);
             }
 
             ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
@@ -788,9 +1056,9 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
 
             fd = open("/dev/null", O_RDWR);
 
-            dup2(fd, STDIN_FILENO);
-            dup2(fd, STDOUT_FILENO);
-            dup2(fd, STDERR_FILENO);
+            ngx_set_stdin(fd);
+            ngx_set_stdout(fd);
+            ngx_set_stderr(fd);
 
             args = ngx_alloc((ec->args.nelts + 2) * sizeof(char *), e->log);
             if (args == NULL) {
@@ -823,12 +1091,12 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
                 char    **p;
 
                 for (p = args; *p; p++) {
-                    ngx_write_fd(STDERR_FILENO, "'", 1);
-                    ngx_write_fd(STDERR_FILENO, *p, strlen(*p));
-                    ngx_write_fd(STDERR_FILENO, "' ", 2);
+                    ngx_write_fd(ngx_stderr, "'", 1);
+                    ngx_write_fd(ngx_stderr, *p, strlen(*p));
+                    ngx_write_fd(ngx_stderr, "' ", 2);
                 }
 
-                ngx_write_fd(STDERR_FILENO, "\n", 1);
+                ngx_write_fd(ngx_stderr, "\n", 1);
             }
 #endif
 
@@ -837,9 +1105,9 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
 
                 msg = strerror(errno);
 
-                ngx_write_fd(STDERR_FILENO, "execvp error: ", 14);
-                ngx_write_fd(STDERR_FILENO, msg, strlen(msg));
-                ngx_write_fd(STDERR_FILENO, "\n", 1);
+                ngx_write_fd(ngx_stderr, "execvp error: ", 14);
+                ngx_write_fd(ngx_stderr, msg, strlen(msg));
+                ngx_write_fd(ngx_stderr, "\n", 1);
 
                 exit(1);
             }
@@ -850,11 +1118,11 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
 
             /* parent */
 
-            if (pipefd[1] != -1) {
-                close(pipefd[1]);
+            if (pipefd[1] != NGX_INVALID_FILE) {
+                ngx_close_file(pipefd[1]);
             }
 
-            if (pipefd[0] != -1) {
+            if (pipefd[0] != NGX_INVALID_FILE) {
 
                 e->active = 1;
                 e->pid = pid;
@@ -864,7 +1132,7 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
                     *e->save_pid = pid;
                 }
 
-                e->dummy_conn.fd = e->pipefd;
+                e->dummy_conn.fd = (ngx_socket_t)e->pipefd;
                 e->dummy_conn.data = e;
                 e->dummy_conn.read  = &e->read_evt;
                 e->dummy_conn.write = &e->write_evt;
@@ -887,6 +1155,7 @@ ngx_rtmp_exec_run(ngx_rtmp_exec_t *e)
     }
 
     return NGX_OK;
+#endif
 }
 
 
@@ -1359,7 +1628,6 @@ ngx_rtmp_exec_record_done(ngx_rtmp_session_t *s, ngx_rtmp_record_done_t *v)
 next:
     return next_record_done(s, v);
 }
-#endif /* NGX_WIN32 */
 
 
 static char *
@@ -1584,8 +1852,6 @@ ngx_rtmp_exec_kill_signal(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static ngx_int_t
 ngx_rtmp_exec_postconfiguration(ngx_conf_t *cf)
 {
-#if !(NGX_WIN32)
-
     next_publish = ngx_rtmp_publish;
     ngx_rtmp_publish = ngx_rtmp_exec_publish;
 
@@ -1597,8 +1863,6 @@ ngx_rtmp_exec_postconfiguration(ngx_conf_t *cf)
 
     next_record_done = ngx_rtmp_record_done;
     ngx_rtmp_record_done = ngx_rtmp_exec_record_done;
-
-#endif /* NGX_WIN32 */
 
     return NGX_OK;
 }

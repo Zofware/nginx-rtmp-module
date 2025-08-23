@@ -191,11 +191,24 @@ ngx_rtmp_eval(void *ctx, ngx_str_t *in, ngx_rtmp_eval_t **e, ngx_str_t *out,
     return NGX_OK;
 }
 
+ngx_fd_t ngx_rtmp_int_to_fd_t(ngx_int_t v)
+{
+    switch (v)
+    {
+        case 0:
+            return ngx_stdin;
+        case 1:
+            return ngx_stdout;
+        case 2:
+            return ngx_stderr;
+        default:
+            return NGX_INVALID_FILE;
+    }
+}
 
 ngx_int_t
 ngx_rtmp_eval_streams(ngx_str_t *in)
 {
-#if !(NGX_WIN32)
     ngx_int_t   mode, create, v, close_src;
     ngx_fd_t    dst, src;
     u_char     *path;
@@ -215,7 +228,10 @@ ngx_rtmp_eval_streams(ngx_str_t *in)
                 return NGX_ERROR;
             }
 
-            dst = (ngx_fd_t) v;
+            if ((dst = ngx_rtmp_int_to_fd_t(v)) == NGX_INVALID_FILE) {
+                return NGX_ERROR;
+            }
+
             mode = NGX_FILE_WRONLY;
             create = NGX_FILE_TRUNCATE;
             path++;
@@ -235,7 +251,10 @@ ngx_rtmp_eval_streams(ngx_str_t *in)
                 return NGX_ERROR;
             }
 
-            dst = (ngx_fd_t) v;
+            if ((dst = ngx_rtmp_int_to_fd_t(v)) == NGX_INVALID_FILE) {
+                return NGX_ERROR;
+            }
+
             mode = NGX_FILE_RDONLY;
             create = NGX_FILE_OPEN;
             path++;
@@ -254,7 +273,11 @@ ngx_rtmp_eval_streams(ngx_str_t *in)
         if (v == NGX_ERROR) {
             return NGX_ERROR;
         }
-        src = (ngx_fd_t) v;
+
+        if ((src = ngx_rtmp_int_to_fd_t(v)) == NGX_INVALID_FILE) {
+            return NGX_ERROR;
+        }
+
         close_src = 0;
 
     } else {
@@ -271,14 +294,18 @@ ngx_rtmp_eval_streams(ngx_str_t *in)
         return NGX_OK;
     }
 
-    dup2(src, dst);
+    if (src == ngx_stdin) {
+        ngx_set_stdin(dst);
+    } else if (src == ngx_stdout) {
+        ngx_set_stdout(dst);
+    } else if (src == ngx_stderr) {
+        ngx_set_stderr(dst);
+    } else {
+        return NGX_ERROR;
+    }
 
     if (close_src) {
         ngx_close_file(src);
     }
     return NGX_OK;
-
-#else
-    return NGX_DONE;
-#endif
 }
