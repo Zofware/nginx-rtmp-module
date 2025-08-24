@@ -91,6 +91,7 @@ typedef struct {
 #if NGX_WIN32
     ngx_fd_t                            pipefd_child;
     ngx_fd_t                            process_child;
+    ngx_tid_t                           thread_child;
 #endif
 } ngx_rtmp_exec_t;
 
@@ -696,6 +697,12 @@ ngx_rtmp_exec_kill(ngx_rtmp_exec_t *e, ngx_int_t kill_signal)
                        "exec: killed pid=%i", (ngx_int_t) e->pid);
     }
 
+#if (NGX_WIN32)
+    ngx_close_file(e->process_child);
+    WaitForSingleObject(e->thread_child, INFINITE);
+    ngx_close_file(e->thread_child);
+#endif
+
     return NGX_OK;
 }
 
@@ -826,7 +833,7 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
         ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
 
         if (CreateProcess(NULL, command_line,
-                        NULL, NULL, 0, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)
+                        NULL, NULL, 0, CREATE_NEW_CONSOLE/*CREATE_NO_WINDOW*/ | CREATE_SUSPENDED, NULL, NULL, &si, &pi)
             == 0)
         {
             ngx_log_error(NGX_LOG_CRIT, e->log, ngx_errno,
@@ -836,14 +843,6 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
             break;
         }
 
-        if (CloseHandle(pi.hThread) == 0) {
-            ngx_log_error(NGX_LOG_ALERT, e->log, ngx_errno,
-                        "CloseHandle(pi.hThread) failed");
-        }
-
-        ngx_log_error(NGX_LOG_NOTICE, e->log, 0,
-                    "start %s process %P", (const char *)args[0], pi.dwProcessId);
-
         e->pid = pi.dwProcessId;
         e->process_child = pi.hProcess;
 
@@ -852,6 +851,16 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
         }
 
         e->active = 1;
+
+        ResumeThread(pi.hThread);
+
+        if (CloseHandle(pi.hThread) == 0) {
+            ngx_log_error(NGX_LOG_ALERT, e->log, ngx_errno,
+                        "CloseHandle(pi.hThread) failed");
+        }
+
+        ngx_log_error(NGX_LOG_NOTICE, e->log, 0,
+                    "start %s process %P", (const char *)args[0], pi.dwProcessId);
 
         // wait for the process to end
         WaitForSingleObject(e->process_child, INFINITE);
@@ -881,7 +890,6 @@ ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
     ngx_fd_t                pipefd[2];
     ngx_rtmp_exec_conf_t   *ec;
     ngx_tid_t               tid;
-    ngx_err_t               err;
 
     ec = e->conf;
 
@@ -906,12 +914,34 @@ ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
         }
     }
 
+    // create thread
+    // in thread,
+    //      create process
+    //      wait for process to exit
+    //      call ngx_rtmp_exec_child_dead
+    tid = CreateThread(NULL, 0, ngx_rtmp_exec_run_win32_thread, e, CREATE_SUSPENDED, NULL);
+    if (tid == NULL) {
+
+        if (pipefd[0] != NGX_INVALID_FILE) {
+            ngx_close_file(pipefd[0]);
+        }
+
+        if (pipefd[1] != NGX_INVALID_FILE) {
+            ngx_close_file(pipefd[1]);
+        }
+
+        ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
+                        "exec: thread creation failed");
+        return NGX_ERROR;
+    }
+
     if (pipefd[0] != NGX_INVALID_FILE && pipefd[1] != NGX_INVALID_FILE) {
 
         // active and pid set on child thread
 
         e->pipefd = pipefd[0];
         e->pipefd_child = pipefd[1];
+        e->thread_child = tid;
 
         e->dummy_conn.fd = (ngx_socket_t)e->pipefd;
         e->dummy_conn.data = e;
@@ -922,31 +952,14 @@ ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
 
         e->read_evt.log = e->log;
         e->read_evt.handler = ngx_rtmp_exec_child_dead;
-    }
-
-    // create thread
-    // in thread,
-    //      create process
-    //      wait for process to exit
-    //      call ngx_rtmp_exec_child_dead
-    err = ngx_create_thread(&tid, ngx_rtmp_exec_run_win32_thread, e, e->log);
-    if (err != 0) {
-
-        ngx_close_file(pipefd[0]);
-        ngx_close_file(pipefd[1]);
-
-        ngx_log_error(NGX_LOG_INFO, e->log, err,
-                        "exec: thread creation failed");
-        return NGX_ERROR;
-    }
-
-    if (pipefd[0] != NGX_INVALID_FILE && pipefd[1] != NGX_INVALID_FILE) {
 
         if (ngx_add_event(&e->read_evt, NGX_READ_EVENT, 0) != NGX_OK) {
             ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
                             "exec: failed to add child control event");
         }
     }
+
+    ResumeThread(tid);
 
     return NGX_OK;
 }
