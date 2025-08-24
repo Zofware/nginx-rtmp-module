@@ -712,30 +712,105 @@ ngx_rtmp_exec_kill(ngx_rtmp_exec_t *e, ngx_int_t kill_signal)
 
 ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
 {
-    ngx_rtmp_exec_t        *e;
-    char                  **args, **arg_out;
-    ngx_str_t              *arg_in, a;
-    ngx_uint_t              n;
+    ngx_rtmp_exec_t    *e;
+    ngx_fd_t            process_child;
+    ngx_fd_t            pipefd_child;
+
+    e = (ngx_rtmp_exec_t *)arg;
+    process_child = e->process_child;
+    pipefd_child = e->pipefd_child;
+
+    // wait for the process to end
+    WaitForSingleObject(e->process_child, INFINITE);
+
+    // signal that the process ended
+    ngx_write_fd(e->pipefd_child, "end", 3);
+
+    return 0;
+}
+
+
+static ngx_int_t
+ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
+{
+    ngx_int_t               err;
+    ngx_fd_t                pipefd[2];
     ngx_rtmp_exec_conf_t   *ec;
+    ngx_tid_t               tid;
+    char                  **args, **args_to_free;
+    char                   *command_line;
     STARTUPINFO             si;
     PROCESS_INFORMATION     pi;
-    char                   *command_line;
-    size_t                  command_line_cb;
-    ngx_thread_value_t      ret;
+
+    err = NGX_OK;
+
+    pipefd[0] = NGX_INVALID_FILE;
+    pipefd[1] = NGX_INVALID_FILE;
+
+    ec = e->conf;
+
+    tid = NULL;
 
     args = NULL;
+    args_to_free = NULL;
     command_line = NULL;
 
-    do {
-        e = (ngx_rtmp_exec_t *)arg;
-        ec = e->conf;
-        ret = 0;
+    ngx_memzero(&si, sizeof(STARTUPINFO));
+    si.cb = sizeof(STARTUPINFO);
 
-        args = ngx_alloc((ec->args.nelts + 2) * sizeof(char *), e->log);
-        if (args == NULL) {
-            ret = 1;
-            break;
+    ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
+
+    ngx_log_error(NGX_LOG_INFO, e->log, 0,
+                  "exec: starting %s child '%V'",
+                  e->managed ? "managed" : "unmanaged", &ec->cmd);
+
+    if (e->managed) {
+
+        if (e->active) {
+            ngx_log_debug1(NGX_LOG_DEBUG_RTMP, e->log, 0,
+                           "exec: already active '%V'", &ec->cmd);
+            goto done;
         }
+
+        if (!CreatePipe(&pipefd[0], &pipefd[1], NULL, 0)) {
+            ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
+                          "exec: pipe failed");
+            goto error;
+        }
+    }
+
+    // create thread to wait for exec process to finish
+    tid = CreateThread(NULL, 0, ngx_rtmp_exec_run_win32_thread, e, CREATE_SUSPENDED, NULL);
+    if (tid == NULL) {
+
+        ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
+                        "exec: thread creation failed");
+        goto error;
+    }
+
+    // create exec process
+    {
+        char          **arg_out, **arg_to_free;
+        ngx_str_t      *arg_in, a;
+        ngx_uint_t      n;
+        size_t          command_line_cb;
+        size_t          args_max;
+
+        args_max = (ec->args.nelts + 2);
+        
+        args = ngx_alloc(args_max * sizeof(char *), e->log);
+        if (args == NULL) {
+            goto error;
+        }
+        ngx_memzero(args, args_max * sizeof(char *));
+
+        args_to_free = ngx_alloc(args_max * sizeof(char *), e->log);
+        if (args_to_free == NULL) {
+            goto error;
+        }
+        ngx_memzero(args_to_free, args_max * sizeof(char *));
+
+        arg_to_free = args_to_free;
 
         arg_in = ec->args.elts;
         arg_out = args;
@@ -747,6 +822,9 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
                 a = *arg_in;
             } else {
                 ngx_rtmp_eval(e->eval_ctx, arg_in, e->eval, &a, e->log);
+                if (a.data != NULL) {
+                    *arg_to_free++ = (char *) a.data;
+                }
             }
 
             if (ngx_rtmp_eval_streams(&a) != NGX_DONE) {
@@ -755,8 +833,6 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
 
             *arg_out++ = (char *) a.data;
         }
-
-        *arg_out = NULL;
 
 #if (NGX_DEBUG)
         {
@@ -777,39 +853,27 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
 
             size_t arg_cb;
             if (FAILED(StringCbLength(*arg_out, command_line_cb + 9999, &arg_cb))) {
-                ret = 1;
-                break;
+                goto error;
             }
 
             command_line_cb += arg_cb;
-        }
-
-        if (ret) {
-            break;
         }
 
         // Account for spaces between args.
         {
             size_t space_cb;
             if (FAILED(StringCbLength(" \0", command_line_cb + 9999, &space_cb))) {
-                ret = 1;
-                break;
+                goto error;
             }
 
             // Also add space for no fewer than one null terminator.
             command_line_cb += space_cb * (ec->args.nelts + 1 + 1);
         }
 
-        if (command_line_cb == 0) {
-            ret = 1;
-            break;
-        }
-
         // allocate command line buffer
         command_line = ngx_alloc(command_line_cb, e->log);
         if (command_line == NULL) {
-            ret = 1;
-            break;
+            goto error;
         }
         command_line[0] = '\0';
 
@@ -818,19 +882,9 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
 
             if (FAILED(StringCbCat(command_line, command_line_cb, *arg_out)) ||
                 FAILED(StringCbCat(command_line, command_line_cb, " "))) {
-                ret = 1;
-                break;
+                goto error;
             }
         }
-
-        if (ret) {
-            break;
-        }
-
-        ngx_memzero(&si, sizeof(STARTUPINFO));
-        si.cb = sizeof(STARTUPINFO);
-
-        ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
 
         if (CreateProcess(NULL, command_line,
                         NULL, NULL, 0, /*CREATE_NEW_CONSOLE*/ CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi)
@@ -839,9 +893,14 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
             ngx_log_error(NGX_LOG_CRIT, e->log, ngx_errno,
                         "CreateProcess(\"%s\") failed", (const char *)args[0]);
 
-            ret = 1;
-            break;
+            goto error;
         }
+
+    }
+
+    if (pipefd[0] != NGX_INVALID_FILE && pipefd[1] != NGX_INVALID_FILE) {
+
+        e->active = 1;
 
         e->pid = pi.dwProcessId;
         e->process_child = pi.hProcess;
@@ -849,95 +908,6 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
         if (e->save_pid) {
             *e->save_pid = pi.dwProcessId;
         }
-
-        e->active = 1;
-
-        ResumeThread(pi.hThread);
-
-        if (CloseHandle(pi.hThread) == 0) {
-            ngx_log_error(NGX_LOG_ALERT, e->log, ngx_errno,
-                        "CloseHandle(pi.hThread) failed");
-        }
-
-        ngx_log_error(NGX_LOG_NOTICE, e->log, 0,
-                    "start %s process %P", (const char *)args[0], pi.dwProcessId);
-
-        // wait for the process to end
-        WaitForSingleObject(e->process_child, INFINITE);
-
-        // signal that the process ended
-        ngx_write_fd(e->pipefd_child, "end", 3);
-
-    } while (0);
-
-    if (args != NULL) {
-        ngx_free(args);
-        args = NULL;
-    }
-
-    if (command_line != NULL) {
-        ngx_free(command_line);
-        command_line = NULL;
-    }
-
-    return ret;
-}
-
-
-static ngx_int_t
-ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
-{
-    ngx_fd_t                pipefd[2];
-    ngx_rtmp_exec_conf_t   *ec;
-    ngx_tid_t               tid;
-
-    ec = e->conf;
-
-    ngx_log_error(NGX_LOG_INFO, e->log, 0,
-                  "exec: starting %s child '%V'",
-                  e->managed ? "managed" : "unmanaged", &ec->cmd);
-
-    pipefd[0] = NGX_INVALID_FILE;
-    pipefd[1] = NGX_INVALID_FILE;
-
-    if (e->managed) {
-
-        if (e->active) {
-            ngx_log_debug1(NGX_LOG_DEBUG_RTMP, e->log, 0,
-                           "exec: already active '%V'", &ec->cmd);
-            return NGX_OK;
-        }
-
-        if (!CreatePipe(&pipefd[0], &pipefd[1], NULL, 0)) {
-            ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
-                          "exec: pipe failed");
-        }
-    }
-
-    // create thread
-    // in thread,
-    //      create process
-    //      wait for process to exit
-    //      call ngx_rtmp_exec_child_dead
-    tid = CreateThread(NULL, 0, ngx_rtmp_exec_run_win32_thread, e, CREATE_SUSPENDED, NULL);
-    if (tid == NULL) {
-
-        if (pipefd[0] != NGX_INVALID_FILE) {
-            ngx_close_file(pipefd[0]);
-        }
-
-        if (pipefd[1] != NGX_INVALID_FILE) {
-            ngx_close_file(pipefd[1]);
-        }
-
-        ngx_log_error(NGX_LOG_INFO, e->log, ngx_errno,
-                        "exec: thread creation failed");
-        return NGX_ERROR;
-    }
-
-    if (pipefd[0] != NGX_INVALID_FILE && pipefd[1] != NGX_INVALID_FILE) {
-
-        // active and pid set on child thread
 
         e->pipefd = pipefd[0];
         e->pipefd_child = pipefd[1];
@@ -959,9 +929,61 @@ ngx_rtmp_exec_run_win32(ngx_rtmp_exec_t *e)
         }
     }
 
+    ngx_log_error(NGX_LOG_NOTICE, e->log, 0,
+                "start %s process %P", (const char *)args[0], pi.dwProcessId);
+
+    // Start the exec process.
+    ResumeThread(pi.hThread);
+
+    // Start the thread to wait for the process to finish.
     ResumeThread(tid);
 
-    return NGX_OK;
+    // success
+    goto done;
+
+error:
+
+    if (err != NGX_OK) {
+        if (pipefd[0] != NGX_INVALID_FILE) {
+            ngx_close_file(pipefd[0]);
+        }
+
+        if (pipefd[1] != NGX_INVALID_FILE) {
+            ngx_close_file(pipefd[1]);
+        }
+    }
+
+    if (tid != NULL) {
+        ngx_close_file(tid);
+    }
+
+    if (pi.hProcess != NULL) {
+        CloseHandle(pi.hProcess);
+    }
+
+done:
+
+    if (args_to_free != NULL) {
+        char **p;
+        for (p = args_to_free; *p; p++) {
+            ngx_free(*p);
+        }
+        ngx_free(args_to_free);
+    }
+
+    if (args != NULL) {
+        ngx_free(args);
+    }
+
+    if (command_line != NULL) {
+        ngx_free(command_line);
+    }
+
+    if (pi.hThread != NULL) {
+        CloseHandle(pi.hThread);
+    }
+
+    return err;
 }
 
 #endif // NGX_WIN32
