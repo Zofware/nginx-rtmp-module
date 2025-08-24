@@ -833,7 +833,7 @@ ngx_thread_value_t __stdcall ngx_rtmp_exec_run_win32_thread(void *arg)
         ngx_memzero(&pi, sizeof(PROCESS_INFORMATION));
 
         if (CreateProcess(NULL, command_line,
-                        NULL, NULL, 0, CREATE_NEW_CONSOLE/*CREATE_NO_WINDOW*/ | CREATE_SUSPENDED, NULL, NULL, &si, &pi)
+                        NULL, NULL, 0, /*CREATE_NEW_CONSOLE*/ CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL, NULL, &si, &pi)
             == 0)
         {
             ngx_log_error(NGX_LOG_CRIT, e->log, ngx_errno,
